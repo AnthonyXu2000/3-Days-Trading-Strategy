@@ -1,25 +1,32 @@
 """
 短线反弹策略 - 每日盘后选股扫描脚本
 ====================================
-数据源: Yahoo Finance (yfinance)，免费，无需 API Key
+数据源: Yahoo Finance chart API (直接用 requests 调用)，免费，无需 API Key
 标的池: 标普500 + 纳斯达克100 成分股并集
 用法: 收盘后运行 `python scan.py`，输出当日(T日)满足全部6条筛选条件的候选标的
 
 依赖安装:
-    pip install yfinance pandas numpy lxml requests
+    pip install pandas numpy lxml requests
 
 建议用 cron / Windows 计划任务 在每天美股收盘后 30-60 分钟自动运行本脚本
 (建议延迟一点，避免数据源当天数据还没完全更新)
 """
 
+import io
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
+import requests
+
 
 warnings.filterwarnings("ignore")
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+
+
 
 # ========== 可调参数（先固定下来，方便回测；回测完再微调）==========
 CONFIG = {
@@ -42,12 +49,16 @@ def get_index_constituents():
     可以把 sp500 / nasdaq100 换成手动维护的静态列表作为 fallback。
     """
     sp500_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    nasdaq100_url = "https://en.wikipedia.org/wiki/Nasdaq-100"
+    nasdaq100_url = "https://en.wikipedia.org/wiki/List_of_NASDAQ-100_companies"
+    # 维基百科会对无 User-Agent 的请求返回 403，需要伪装成浏览器请求
+    headers = {"User-Agent": USER_AGENT}
 
-    sp500 = pd.read_html(sp500_url)[0]["Symbol"].tolist()
+    sp500_html = requests.get(sp500_url, headers=headers, timeout=30).text
+    sp500 = pd.read_html(io.StringIO(sp500_html))[0]["Symbol"].tolist()
 
+    nasdaq100_html = requests.get(nasdaq100_url, headers=headers, timeout=30).text
     nasdaq100 = None
-    for t in pd.read_html(nasdaq100_url):
+    for t in pd.read_html(io.StringIO(nasdaq100_html)):
         if "Ticker" in t.columns:
             nasdaq100 = t["Ticker"].tolist()
             break
@@ -154,26 +165,55 @@ def compute_signals(df, cfg):
     }
 
 
-def scan_universe(universe, cfg, batch_size=100):
-    """分批下载，避免单次请求标的过多导致 yfinance 不稳定"""
+    def download_history(session, ticker, cfg):
+    """通过 Yahoo Finance chart API 直接用 requests 下载单只标的的历史日线数据。"""
+    url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"
+    params = {"range": cfg["history_period"], "interval": "1d"}
+    resp = session.get(url, params=params, timeout=15)
+    resp.raise_for_status()
+    result = (resp.json().get("chart") or {}).get("result")
+    if not result:
+        return None
+
+    result = result[0]
+    ts = result.get("timestamp")
+    if not ts:
+        return None
+    quote = result["indicators"]["quote"][0]
+
+    df = pd.DataFrame(
+        {
+            "Open": quote.get("open"),
+            "High": quote.get("high"),
+            "Low": quote.get("low"),
+            "Close": quote.get("close"),
+            "Volume": quote.get("volume"),
+        },
+        index=pd.to_datetime(ts, unit="s"),
+    )
+    df.index = df.index.tz_localize(None).normalize()
+    return df.dropna(subset=["Close"])
+
+
+def scan_universe(universe, cfg, max_workers=16):
     results = []
-    print(f"标的池共 {len(universe)} 只，开始分批下载历史数据...")
+    print(f"标的池共 {len(universe)} 只，开始下载历史数据...")
 
-    for i in range(0, len(universe), batch_size):
-        batch = universe[i : i + batch_size]
-        print(f"  下载第 {i // batch_size + 1} 批 ({len(batch)} 只)...")
-        data = yf.download(
-            batch,
-            period=cfg["history_period"],
-            group_by="ticker",
-            auto_adjust=False,
-            threads=True,
-            progress=False,
-        )
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
+    done = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_ticker = {
+            executor.submit(download_history, session, ticker, cfg): ticker for ticker in universe
+        }
+        for future in as_completed(future_to_ticker):
+            ticker = future_to_ticker[future]
+            done += 1
+            if done % 100 == 0:
+                print(f"  已处理 {done}/{len(universe)} ...")
 
-        for ticker in batch:
             try:
-                df = data[ticker].dropna(subset=["Close"]) if len(batch) > 1 else data.dropna(subset=["Close"])
+                df = future.result()
                 sig = compute_signals(df, cfg)
                 if sig:
                     sig["ticker"] = ticker
