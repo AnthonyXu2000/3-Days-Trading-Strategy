@@ -164,8 +164,7 @@ def compute_signals(df, cfg):
         "ema120": round(float(ema120_t1), 2),
     }
 
-
-    def download_history(session, ticker, cfg):
+def download_history(session, ticker, cfg):
     """通过 Yahoo Finance chart API 直接用 requests 下载单只标的的历史日线数据。"""
     url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"
     params = {"range": cfg["history_period"], "interval": "1d"}
