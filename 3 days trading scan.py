@@ -14,6 +14,7 @@
 
 import io
 import warnings
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -72,13 +73,23 @@ def get_index_constituents():
     return universe
 
 
-def compute_signals(df, cfg):
+def compute_signals(df, cfg, stats=None):
     """
     对单只标的的历史数据 (df: 按日期升序的 Open/High/Low/Close/Volume)
     判断最新一个交易日(T日 = 信号日)是否满足全部6条筛选条件。
     满足则返回结果 dict，否则返回 None。
+
+    stats: 可选的 collections.Counter，用于记录每一步筛选的漏斗计数，
+           方便判断"今天没有candidate"到底是条件太严还是数据有问题。
     """
+    def bump(key):
+        if stats is not None:
+            stats[key] += 1
+
+    bump("00_total_checked")
+
     if df is None or len(df) < cfg["min_history_days"]:
+        bump("01_fail_not_enough_history")
         return None
 
     df = df.copy()
@@ -89,6 +100,7 @@ def compute_signals(df, cfg):
 
     N = cfg["ema_lookback_days"]
     if len(df) < 120 + N + cfg["pullback_window"] + 2:
+        bump("01_fail_not_enough_history")
         return None
 
     T_date = df.index[-1]      # 建仓日 / 信号日
@@ -99,22 +111,28 @@ def compute_signals(df, cfg):
     ema60_t1 = df.loc[T1_date, "EMA60"]
     ema120_t1 = df.loc[T1_date, "EMA120"]
     if not (ema30_t1 > ema60_t1 > ema120_t1):
+        bump("02_fail_ema_alignment")
         return None
+    bump("02_pass_ema_alignment")
 
     # "右高左低"：三条均线当前值都要高于 N 天前的自己
     idx_t1 = df.index.get_loc(T1_date)
     idx_t1_minus_n = idx_t1 - N
     if idx_t1_minus_n < 0:
+        bump("01_fail_not_enough_history")
         return None
     ema30_t1_n = df["EMA30"].iloc[idx_t1_minus_n]
     ema60_t1_n = df["EMA60"].iloc[idx_t1_minus_n]
     ema120_t1_n = df["EMA120"].iloc[idx_t1_minus_n]
     if not (ema30_t1 > ema30_t1_n and ema60_t1 > ema60_t1_n and ema120_t1 > ema120_t1_n):
+        bump("03_fail_ema_rising")
         return None
+    bump("03_pass_ema_rising")
 
     # ---- 条件2: 回调幅度（T-10 到 T-1 窗口，用最高价/最低价）----
     window = df.iloc[-(cfg["pullback_window"] + 1) : -1]
     if len(window) < cfg["pullback_window"]:
+        bump("01_fail_not_enough_history")
         return None
     hi_val = window["High"].max()
     lo_val = window["Low"].min()
@@ -122,9 +140,13 @@ def compute_signals(df, cfg):
     lo_pos = int(np.argmin(window["Low"].values))
     pullback_pct = (hi_val - lo_val) / hi_val
     if pullback_pct < cfg["pullback_min_pct"]:
+        bump("04_fail_pullback_pct")
         return None
+    bump("04_pass_pullback_pct")
     if not (hi_pos < lo_pos):   # 高点必须严格早于低点
+        bump("05_fail_pullback_order")
         return None
+    bump("05_pass_pullback_order")
 
     # ---- 条件3: 建仓当天(T日)K线形态 ----
     open_t = df.loc[T_date, "Open"]
@@ -134,23 +156,36 @@ def compute_signals(df, cfg):
     ema10_t = df.loc[T_date, "EMA10"]
 
     if not (close_t > open_t):
+        bump("06_fail_bullish_candle")
         return None
+    bump("06_pass_bullish_candle")
     day_gain = (close_t - close_t1) / close_t1
     if not (day_gain < cfg["max_gain_pct"]):
+        bump("07_fail_day_gain_cap")
         return None
+    bump("07_pass_day_gain_cap")
     if not (low_t < ema10_t):
+        bump("08_fail_low_touch_ema10")
         return None
+    bump("08_pass_low_touch_ema10")
     if not (close_t > ema10_t):
+        bump("09_fail_close_above_ema10")
         return None
+    bump("09_pass_close_above_ema10")
 
     # ---- 条件4: 价格门槛 ----
     if not (close_t > cfg["min_price"]):
+        bump("10_fail_price_floor")
         return None
+    bump("10_pass_price_floor")
 
     # ---- 条件5: 流动性门槛 ----
     avg_vol = df["Volume"].iloc[-cfg["volume_window"] :].mean()
     if not (avg_vol >= cfg["min_avg_volume"]):
+        bump("11_fail_liquidity")
         return None
+    bump("11_pass_liquidity")
+    bump("12_final_candidate")
 
     return {
         "signal_date": T_date.strftime("%Y-%m-%d"),
@@ -196,6 +231,9 @@ def download_history(session, ticker, cfg):
 
 def scan_universe(universe, cfg, max_workers=16):
     results = []
+    stats = Counter()
+    download_ok = 0
+    download_fail = 0
     print(f"标的池共 {len(universe)} 只，开始下载历史数据...")
 
     session = requests.Session()
@@ -213,23 +251,67 @@ def scan_universe(universe, cfg, max_workers=16):
 
             try:
                 df = future.result()
-                sig = compute_signals(df, cfg)
+                if df is None or df.empty:
+                    download_fail += 1
+                    continue
+                download_ok += 1
+                sig = compute_signals(df, cfg, stats=stats)
                 if sig:
                     sig["ticker"] = ticker
                     results.append(sig)
             except Exception:
+                download_fail += 1
                 continue
 
-    return pd.DataFrame(results)
+    stats["download_ok"] = download_ok
+    stats["download_fail"] = download_fail
+    stats["universe_total"] = len(universe)
+
+    return pd.DataFrame(results), stats
 
 
 if __name__ == "__main__":
     universe = get_index_constituents()
-    df_result = scan_universe(universe, CONFIG)
+    df_result, stats = scan_universe(universe, CONFIG)
 
     today_str = datetime.now().strftime("%Y-%m-%d")
+
+    # ---- 诊断漏斗：不管有没有candidate，都打印这一段 ----
+    print("\n===== 诊断漏斗 (DIAGNOSTIC FUNNEL) =====")
+    print(f"标的池总数 universe_total: {stats.get('universe_total', 0)}")
+    print(f"数据下载成功 download_ok: {stats.get('download_ok', 0)}")
+    print(f"数据下载失败 download_fail: {stats.get('download_fail', 0)}")
+    funnel_labels = {
+        "01_fail_not_enough_history": "历史数据不足(EMA120 warm-up不够)",
+        "02_pass_ema_alignment": "通过-条件1a均线多头排列",
+        "02_fail_ema_alignment": "未通过-条件1a均线多头排列",
+        "03_pass_ema_rising": "通过-条件1b右高左低",
+        "03_fail_ema_rising": "未通过-条件1b右高左低",
+        "04_pass_pullback_pct": "通过-条件2a回调幅度>=10%",
+        "04_fail_pullback_pct": "未通过-条件2a回调幅度>=10%",
+        "05_pass_pullback_order": "通过-条件2b高点早于低点",
+        "05_fail_pullback_order": "未通过-条件2b高点早于低点",
+        "06_pass_bullish_candle": "通过-条件3a阳线",
+        "06_fail_bullish_candle": "未通过-条件3a阳线",
+        "07_pass_day_gain_cap": "通过-条件3b涨幅<8%",
+        "07_fail_day_gain_cap": "未通过-条件3b涨幅<8%",
+        "08_pass_low_touch_ema10": "通过-条件3c最低价<10EMA",
+        "08_fail_low_touch_ema10": "未通过-条件3c最低价<10EMA",
+        "09_pass_close_above_ema10": "通过-条件3d收盘>10EMA",
+        "09_fail_close_above_ema10": "未通过-条件3d收盘>10EMA",
+        "10_pass_price_floor": "通过-条件4价格>$20",
+        "10_fail_price_floor": "未通过-条件4价格>$20",
+        "11_pass_liquidity": "通过-条件5流动性达标",
+        "11_fail_liquidity": "未通过-条件5流动性达标",
+        "12_final_candidate": "最终候选标的数",
+    }
+    for key in sorted(funnel_labels):
+        if key in stats:
+            print(f"  {funnel_labels[key]}: {stats[key]}")
+    print("=========================================\n")
+
     if df_result.empty:
-        print(f"\n[{today_str}] 今日没有标的满足全部筛选条件。")
+        print(f"[{today_str}] 今日没有标的满足全部筛选条件。")
     else:
         cols = [
             "ticker", "signal_date", "close", "day_gain_pct",
