@@ -5,6 +5,20 @@
 标的池: 标普500 + 纳斯达克100 成分股并集
 用法: 收盘后运行 `python scan.py`，输出当日(T日)满足全部6条筛选条件的候选标的
 
+本脚本不含任何策略参数的默认值 —— 全部7个策略参数必须通过命令行传入，
+否则会直接报错退出。这是有意为之：脚本本身是通用引擎，公开托管；
+具体的参数数值（回调幅度门槛、涨幅上限等）不写进代码里。
+
+用法示例:
+    python scan.py \\
+        --ema_lookback_days 10 \\
+        --pullback_window 10 \\
+        --pullback_min_pct 0.10 \\
+        --max_gain_pct 0.08 \\
+        --min_price 20 \\
+        --min_avg_volume 5000000 \\
+        --volume_window 5
+
 依赖安装:
     pip install pandas numpy lxml requests
 
@@ -12,6 +26,7 @@
 (建议延迟一点，避免数据源当天数据还没完全更新)
 """
 
+import argparse
 import io
 import warnings
 from collections import Counter
@@ -27,20 +42,31 @@ warnings.filterwarnings("ignore")
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 
-
-
-# ========== 可调参数（先固定下来，方便回测；回测完再微调）==========
-CONFIG = {
-    "ema_lookback_days": 10,       # 均线"右高左左"对比基准 N（对比 N 天前的自己）
-    "pullback_window": 10,         # 回调幅度观察窗口（交易日，T-10 到 T-1）
-    "pullback_min_pct": 0.10,      # 最小回调幅度 10%
-    "max_gain_pct": 0.08,          # 建仓日涨幅上限 8%
-    "min_price": 20,               # 最低股价 $20
-    "min_avg_volume": 5_000_000,   # 最近5日平均成交量下限
-    "volume_window": 5,            # 成交量平均窗口
-    "history_period": "2y",        # 下载历史数据长度（保证 EMA120 有足够 warm-up）
-    "min_history_days": 300,       # 数据不足这个天数的标的直接跳过（EMA120 warm-up 不够）
-}
+def parse_args():
+    """解析命令行参数。7个策略参数全部必填(required=True)，不给默认值，
+    这样公开仓库里的代码本身不携带任何具体的策略数值。
+    history_period / min_history_days 属于数据抓取的技术细节（不是策略本身
+    的判断条件），保留固定默认值，不算需要保密的部分。"""
+    p = argparse.ArgumentParser(description="短线反弹策略选股扫描引擎")
+    p.add_argument("--ema_lookback_days", type=int, required=True,
+                    help="均线'右高左低'对比基准 N（对比 N 天前的自己）")
+    p.add_argument("--pullback_window", type=int, required=True,
+                    help="回调幅度观察窗口（交易日，T-window 到 T-1）")
+    p.add_argument("--pullback_min_pct", type=float, required=True,
+                    help="最小回调幅度，如 0.10 代表 10%%")
+    p.add_argument("--max_gain_pct", type=float, required=True,
+                    help="建仓日涨幅上限，如 0.08 代表 8%%")
+    p.add_argument("--min_price", type=float, required=True,
+                    help="最低股价门槛（美元）")
+    p.add_argument("--min_avg_volume", type=int, required=True,
+                    help="最近N日平均成交量下限")
+    p.add_argument("--volume_window", type=int, required=True,
+                    help="成交量平均窗口（交易日）")
+    p.add_argument("--history_period", type=str, default="2y",
+                    help="下载历史数据长度，技术参数非策略参数，默认2y")
+    p.add_argument("--min_history_days", type=int, default=300,
+                    help="数据不足这个天数的标的直接跳过，技术参数非策略参数，默认300")
+    return p.parse_args()
 
 
 def get_index_constituents():
@@ -271,6 +297,19 @@ def scan_universe(universe, cfg, max_workers=16):
 
 
 if __name__ == "__main__":
+    args = parse_args()
+    CONFIG = {
+        "ema_lookback_days": args.ema_lookback_days,
+        "pullback_window": args.pullback_window,
+        "pullback_min_pct": args.pullback_min_pct,
+        "max_gain_pct": args.max_gain_pct,
+        "min_price": args.min_price,
+        "min_avg_volume": args.min_avg_volume,
+        "volume_window": args.volume_window,
+        "history_period": args.history_period,
+        "min_history_days": args.min_history_days,
+    }
+
     universe = get_index_constituents()
     df_result, stats = scan_universe(universe, CONFIG)
 
